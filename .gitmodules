@@ -1,0 +1,4 @@
+[submodule "thirdparty/llama.cpp"]
+	path = thirdparty/llama.cpp
+	url = https://github.com/Menooker/llama.cpp-adaptive-kv-streaming
+	branch = feature/kv-stream-phase-arena

@@ -1,0 +1,4 @@
+add_executable(mambo_ggml_reference ggml_reference.cpp)
+target_compile_features(mambo_ggml_reference PRIVATE cxx_std_17)
+target_link_libraries(mambo_ggml_reference PRIVATE ggml)
+
