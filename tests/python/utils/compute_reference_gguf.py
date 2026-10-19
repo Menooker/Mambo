@@ -33,10 +33,9 @@ import numpy as np
 __test__ = False
 
 _HEADER_LIMIT = 1 << 20
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-_SOURCE_ROOT = _REPO_ROOT / "src" / "python"
-if str(_SOURCE_ROOT) not in sys.path:
-    sys.path.insert(0, str(_SOURCE_ROOT))
+from utils.paths import LLAMA_SOURCE, ensure_test_paths
+
+ensure_test_paths()
 
 from mambo.utils.gguf_manifest import inspect_gguf  # noqa: E402
 
@@ -171,7 +170,7 @@ def compute_reference_gguf(
     *,
     model_path: str | Path,
     reference_executable: str | Path,
-    llama_source_dir: str | Path = _REPO_ROOT / "thirdparty" / "llama.cpp",
+    llama_source_dir: str | Path = LLAMA_SOURCE,
     output_backend: ArrayBackend = "same",
     dequant_rows: int = 4,
     threads: int = 1,
