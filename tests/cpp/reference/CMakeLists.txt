@@ -1,4 +1,5 @@
 add_executable(mambo_ggml_reference ggml_reference.cpp)
 target_compile_features(mambo_ggml_reference PRIVATE cxx_std_17)
-target_link_libraries(mambo_ggml_reference PRIVATE ggml)
-
+find_package(CUDAToolkit REQUIRED)
+target_include_directories(mambo_ggml_reference PRIVATE "${MAMBO_LLAMA_SOURCE_DIR}/ggml/src")
+target_link_libraries(mambo_ggml_reference PRIVATE ggml ggml-cuda CUDA::cudart)

@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(MAMBO_BUILD_CPP_TESTS "Build the C++ CUDA Driver API test tools" ON)
-option(MAMBO_BUILD_REFERENCE "Build the CPU ggml reference tool" ON)
+option(MAMBO_BUILD_REFERENCE "Build the CUDA ggml reference tool" ON)
 option(MAMBO_BUILD_PYTHON_TESTS "Register one pytest suite with CTest" ON)
 
 enable_testing()
@@ -24,6 +24,11 @@ if(MAMBO_BUILD_REFERENCE OR MAMBO_BUILD_CPP_TESTS)
 endif()
 
 if(MAMBO_BUILD_REFERENCE)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR
+       "${CMAKE_CUDA_ARCHITECTURES}" STREQUAL "" OR
+       "${CMAKE_CUDA_ARCHITECTURES}" STREQUAL "OFF")
+        message(FATAL_ERROR "Set CMAKE_CUDA_ARCHITECTURES explicitly for the llama.cpp CUDA reference (for this GPU: -DCMAKE_CUDA_ARCHITECTURES=120a-real)")
+    endif()
     find_package(Git REQUIRED)
     execute_process(
         COMMAND "${GIT_EXECUTABLE}" -C "${MAMBO_LLAMA_SOURCE_DIR}" rev-parse HEAD
@@ -37,9 +42,9 @@ if(MAMBO_BUILD_REFERENCE)
     endif()
 
     set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build the pinned ggml reference statically" FORCE)
-    set(GGML_CPU ON CACHE BOOL "Enable the ggml CPU reference" FORCE)
-    set(GGML_CUDA OFF CACHE BOOL "No ggml GPU backend in the reference tool" FORCE)
-    set(GGML_NATIVE OFF CACHE BOOL "Portable reference CPU build" FORCE)
+    set(GGML_CPU ON CACHE BOOL "Enable ggml CPU dequantization traits" FORCE)
+    set(GGML_CUDA ON CACHE BOOL "Enable the ggml CUDA reference" FORCE)
+    set(GGML_NATIVE OFF CACHE BOOL "Avoid host-specific ggml CPU flags" FORCE)
     set(GGML_CCACHE OFF CACHE BOOL "Do not require ccache" FORCE)
     set(GGML_ALL_WARNINGS OFF CACHE BOOL "Disable third-party warning checks" FORCE)
     add_subdirectory("${MAMBO_LLAMA_SOURCE_DIR}/ggml" "${CMAKE_CURRENT_BINARY_DIR}/ggml")

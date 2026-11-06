@@ -1,4 +1,4 @@
-"""Compute gguf-py and ggml CPU references for an operation on GGUF weights.
+"""Compute gguf-py and ggml CUDA references for an operation on GGUF weights.
 
 This is a library module, not a pytest test. Currently ``matmul`` with an
 IQ3_S GGUF weight is supported. The input activation may be a NumPy or CuPy
@@ -11,7 +11,7 @@ Example::
         model_path=model_path, reference_executable=ggml_reference,
     )
     expected = result.gguf_py
-    backend = result.ggml_cpu
+    backend = result.ggml_cuda
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ class ReferenceResult:
     """Reference arrays; the last three come from the pinned C++ ggml tool."""
 
     gguf_py: Any
-    ggml_cpu: Any
+    ggml_cuda: Any
     ggml_dequant_f64: Any
     dequant_rows: Any
     metadata: dict[str, Any]
@@ -132,7 +132,7 @@ def _read_cpp_packet(packet: bytes, *, m: int, k: int, n: int, rows: int) -> tup
     expected = (
         ("dequant_rows", [rows, k]),
         ("ggml_dequant_f64", [m, n]),
-        ("ggml_cpu", [m, n]),
+        ("ggml_cuda", [m, n]),
     )
     descriptors = header.get("arrays")
     if not isinstance(descriptors, list) or len(descriptors) != len(expected):
@@ -173,9 +173,8 @@ def compute_reference_gguf(
     llama_source_dir: str | Path = LLAMA_SOURCE,
     output_backend: ArrayBackend = "same",
     dequant_rows: int = 4,
-    threads: int = 1,
 ) -> ReferenceResult:
-    """Return independent gguf-py and ggml CPU results for ``op``.
+    """Return independent gguf-py and ggml CUDA results for ``op``.
 
     For ``matmul``, ``inputs`` contains ``x`` (an array) and ``weight`` (a GGUF
     tensor name). For now only ``op='matmul'`` with an
@@ -193,8 +192,8 @@ def compute_reference_gguf(
         raise TypeError("weight must be a nonempty GGUF tensor name")
     if output_backend not in ("numpy", "cupy", "same"):
         raise ValueError("output_backend must be 'numpy', 'cupy', or 'same'")
-    if dequant_rows < 1 or threads < 1:
-        raise ValueError("dequant_rows and threads must be positive")
+    if dequant_rows < 1:
+        raise ValueError("dequant_rows must be positive")
     model_path = Path(model_path).expanduser().resolve()
     executable = Path(reference_executable).expanduser().resolve()
     llama_source_dir = Path(llama_source_dir).expanduser().resolve()
@@ -228,7 +227,7 @@ def compute_reference_gguf(
 
     command = [str(executable), "--op", op, "--model", str(model_path),
                "--weight", weight, "--m", str(x_np.shape[0]),
-               "--dequant-rows", str(rows), "--threads", str(threads)]
+               "--dequant-rows", str(rows)]
     run = subprocess.run(command, input=x_np.tobytes(order="C"), capture_output=True, check=False)
     if run.returncode != 0:
         raise RuntimeError(f"ggml reference failed: {run.stderr.decode('utf-8', errors='replace').strip()}")
@@ -239,13 +238,14 @@ def compute_reference_gguf(
         ("row_bytes", tensor["row_bytes"]),
         ("tensor_bytes", tensor["n_bytes"]),
         ("data_offset_absolute", tensor["offset"]["absolute"]),
+        ("ggml_backend", "cuda"),
     ):
         if header.get(key) != expected_value:
             raise ValueError(f"ggml reference header disagrees with GGUF metadata: {key}")
     np.testing.assert_array_equal(cpp_arrays["dequant_rows"], decoded[:rows])
     np.testing.assert_allclose(cpp_arrays["ggml_dequant_f64"], gguf_py, rtol=1e-6, atol=2e-5)
-    if not np.isfinite(cpp_arrays["ggml_cpu"]).all():
-        raise ValueError("ggml CPU output contains NaN or infinity")
+    if not np.isfinite(cpp_arrays["ggml_cuda"]).all():
+        raise ValueError("ggml CUDA output contains NaN or infinity")
 
     def returned(array: np.ndarray, *, is_output: bool = False):
         if is_output and input_was_vector:
@@ -254,7 +254,7 @@ def compute_reference_gguf(
 
     return ReferenceResult(
         gguf_py=returned(gguf_py, is_output=True),
-        ggml_cpu=returned(cpp_arrays["ggml_cpu"], is_output=True),
+        ggml_cuda=returned(cpp_arrays["ggml_cuda"], is_output=True),
         ggml_dequant_f64=returned(cpp_arrays["ggml_dequant_f64"], is_output=True),
         dequant_rows=returned(cpp_arrays["dequant_rows"]),
         metadata=header,

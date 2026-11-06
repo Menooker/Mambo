@@ -1,11 +1,14 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
+#include "ggml-backend-impl.h"
+#include "ggml-cuda.h"
 #include "gguf.h"
+#include <cuda_runtime_api.h>
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -62,6 +65,25 @@ using BackendBufferPtr = std::unique_ptr<ggml_backend_buffer, BackendBufferDelet
 [[noreturn]] void fail(const std::string & message) {
     throw std::runtime_error(message);
 }
+
+void check_cuda(cudaError_t status) {
+    if (status != cudaSuccess) fail(cudaGetErrorString(status));
+}
+
+struct TimingEvent {
+    cudaEvent_t handle{};
+    TimingEvent() { check_cuda(cudaEventCreate(&handle)); }
+    ~TimingEvent() { cudaEventDestroy(handle); }
+    TimingEvent(const TimingEvent &) = delete;
+    TimingEvent & operator=(const TimingEvent &) = delete;
+
+    void record(ggml_backend_t backend) {
+        // ggml's public event constructor disables timing. Wrap our timing-enabled
+        // CUDA event using the pinned event ABI to record on the backend's stream.
+        ggml_backend_event event{ggml_backend_get_device(backend), handle};
+        ggml_backend_event_record(&event, backend);
+    }
+};
 
 uint64_t parse_unsigned(const char * text, const char * name, bool allow_zero = false) {
     const std::string value(text);
@@ -178,7 +200,7 @@ std::string make_header(const std::string & tensor_name,
                         int64_t m,
                         std::size_t dequant_count,
                         std::size_t output_count,
-                        const std::string & input_dot_type) {
+                        const std::string & backend_name) {
     std::ostringstream out;
     out << "{\"schema_version\":1"
         << ",\"op\":\"matmul\""
@@ -188,11 +210,11 @@ std::string make_header(const std::string & tensor_name,
         << ",\"row_bytes\":" << row_bytes
         << ",\"tensor_bytes\":" << tensor_bytes
         << ",\"data_offset_absolute\":" << absolute_offset
-        << ",\"ggml_cpu_input_dot_type\":\"" << json_escape(input_dot_type) << "\""
+        << ",\"ggml_backend\":\"" << json_escape(backend_name) << "\""
         << ",\"arrays\":["
         << array_descriptor("dequant_rows", static_cast<uint64_t>(dequant_rows), static_cast<uint64_t>(k), dequant_count) << ","
         << array_descriptor("ggml_dequant_f64", static_cast<uint64_t>(m), static_cast<uint64_t>(n), output_count) << ","
-        << array_descriptor("ggml_cpu", static_cast<uint64_t>(m), static_cast<uint64_t>(n), output_count)
+        << array_descriptor("ggml_cuda", static_cast<uint64_t>(m), static_cast<uint64_t>(n), output_count)
         << "]}";
     return out.str();
 }
@@ -233,29 +255,26 @@ void write_npy_f32(const std::vector<float> & values, uint64_t rows, uint64_t co
 void write_result(const std::string & header, uint64_t m, uint64_t k, uint64_t n, uint64_t rows,
                   const std::vector<float> & dequant_rows,
                   const std::vector<float> & y_dequant_f64,
-                  const std::vector<float> & y_ggml_cpu) {
+                  const std::vector<float> & y_ggml_cuda) {
     write_npy_header("|u1", "(" + std::to_string(header.size()) + ",)");
     write_bytes(header.data(), header.size(), "JSON metadata array");
     write_npy_f32(dequant_rows, rows, k);
     write_npy_f32(y_dequant_f64, m, n);
-    write_npy_f32(y_ggml_cpu, m, n);
+    write_npy_f32(y_ggml_cuda, m, n);
     std::cout.flush();
     if (!std::cout) {
         fail("failed while flushing NumPy arrays to stdout");
     }
 }
 
-void compute_ggml_cpu(const std::vector<uint8_t> & weights,
+void compute_ggml_cuda(const std::vector<uint8_t> & weights,
                       const std::vector<float> & input,
                       int64_t k,
                       int64_t n,
                       int64_t m,
-                      int threads,
+                      bool benchmark,
+                      int benchmark_iters,
                       std::vector<float> & output) {
-    const ggml_type_traits_cpu * cpu_traits = ggml_get_type_traits_cpu(GGML_TYPE_IQ3_S);
-    if (cpu_traits == nullptr || cpu_traits->vec_dot == nullptr) {
-        fail("ggml CPU IQ3_S dot traits are unavailable");
-    }
     ggml_init_params params{};
     params.mem_size = 1U << 20;
     params.no_alloc = true;
@@ -267,16 +286,16 @@ void compute_ggml_cpu(const std::vector<uint8_t> & weights,
     ggml_tensor * w = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_IQ3_S, k, n);
     ggml_tensor * x = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, k, m);
     ggml_tensor * y = ggml_mul_mat(ctx.get(), w, x);
-    ggml_mul_mat_set_prec(y, GGML_PREC_F32);
     ggml_cgraph * graph = ggml_new_graph(ctx.get());
     ggml_build_forward_expand(graph, y);
 
-    BackendPtr backend(ggml_backend_cpu_init());
+    BackendPtr backend(ggml_backend_cuda_init(0));
     if (!backend) {
-        fail("ggml_backend_cpu_init failed");
+        fail("ggml_backend_cuda_init(0) failed");
     }
-    ggml_backend_cpu_set_n_threads(backend.get(), threads);
-    ggml_backend_cpu_set_use_ref(backend.get(), true);
+    if (!ggml_backend_supports_op(backend.get(), y)) {
+        fail("ggml CUDA backend does not support this IQ3_S matmul");
+    }
 
     BackendBufferPtr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
     if (!buffer) {
@@ -285,10 +304,44 @@ void compute_ggml_cpu(const std::vector<uint8_t> & weights,
     ggml_backend_tensor_set(w, weights.data(), 0, weights.size());
     ggml_backend_tensor_set(x, input.data(), 0, input.size() * sizeof(float));
 
-    const ggml_status status = ggml_backend_graph_compute(backend.get(), graph);
-    if (status != GGML_STATUS_SUCCESS) {
-        fail("ggml CPU graph compute failed with status " + std::to_string(status));
+    auto compute_async = [&]() {
+        const ggml_status status = ggml_backend_graph_compute_async(backend.get(), graph);
+        if (status != GGML_STATUS_SUCCESS) {
+            fail("ggml CUDA graph compute failed with status " + std::to_string(status));
+        }
+    };
+    auto compute = [&]() {
+        compute_async();
+        ggml_backend_synchronize(backend.get());
+    };
+    if (benchmark) {
+        constexpr int warmup_iters = 5;
+        for (int i = 0; i < warmup_iters; ++i) compute();
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < benchmark_iters; ++i) compute();
+        const auto stop = std::chrono::steady_clock::now();
+        const double mean_us = std::chrono::duration<double, std::micro>(stop - start).count() / benchmark_iters;
+        for (int i = 0; i < warmup_iters; ++i) compute_async();
+        ggml_backend_synchronize(backend.get());
+        const auto batch_start = std::chrono::steady_clock::now();
+        for (int i = 0; i < benchmark_iters; ++i) compute_async();
+        ggml_backend_synchronize(backend.get());
+        const auto batch_stop = std::chrono::steady_clock::now();
+        const double batched_us = std::chrono::duration<double, std::micro>(batch_stop - batch_start).count() / benchmark_iters;
+        TimingEvent event_start, event_stop;
+        event_start.record(backend.get());
+        for (int i = 0; i < benchmark_iters; ++i) compute_async();
+        event_stop.record(backend.get());
+        check_cuda(cudaEventSynchronize(event_stop.handle));
+        float elapsed_ms = 0.0f;
+        check_cuda(cudaEventElapsedTime(&elapsed_ms, event_start.handle, event_stop.handle));
+        std::cerr << "benchmark backend=cuda op=matmul m=" << m << " n=" << n << " k=" << k
+                  << " warmup=" << warmup_iters << " iterations=" << benchmark_iters
+                  << " mean_us=" << mean_us << " batched_us=" << batched_us
+                  << " event_us=" << elapsed_ms * 1000.0 / benchmark_iters << '\n';
+        return;
     }
+    compute();
     output.resize(checked_multiply(static_cast<uint64_t>(m),
                                    checked_multiply(static_cast<uint64_t>(n), 1, "output elements"),
                                    "output elements"));
@@ -300,8 +353,9 @@ int run(int argc, char ** argv) {
     if (argc == 2 && std::string(argv[1]) == "--help") {
         std::cerr << "Usage: " << program
                   << " --op matmul --model PATH --weight TENSOR_NAME --m M"
-                     " [--dequant-rows N] [--threads N]\n"
-                     "Reads exactly M*K little-endian float32 values from stdin. Writes four consecutive NumPy .npy arrays to stdout.\n";
+                     " [--dequant-rows N] [--benchmark] [--benchmark-iters N]\n"
+                     "Reads exactly M*K little-endian float32 values from stdin.\n"
+                     "Normally writes four NumPy .npy arrays to stdout; --benchmark writes timing to stderr only.\n";
         return 0;
     }
     if (!is_little_endian()) {
@@ -313,8 +367,9 @@ int run(int argc, char ** argv) {
     std::optional<std::string> tensor_name;
     std::optional<uint64_t> m_argument;
     std::optional<uint64_t> requested_dequant_rows_argument;
-    uint64_t threads_u64 = 1;
-    bool threads_was_set = false;
+    uint64_t benchmark_iters_u64 = 20;
+    bool benchmark_iters_was_set = false;
+    bool benchmark = false;
     auto require_value = [&](int & index, const char * flag) -> const char * {
         if (index + 1 >= argc) {
             fail(std::string("missing value for ") + flag);
@@ -338,28 +393,32 @@ int run(int argc, char ** argv) {
         } else if (flag == "--dequant-rows") {
             if (requested_dequant_rows_argument) fail("--dequant-rows specified more than once");
             requested_dequant_rows_argument = parse_unsigned(require_value(i, "--dequant-rows"), "dequant-rows", true);
-        } else if (flag == "--threads") {
-            if (threads_was_set) fail("--threads specified more than once");
-            threads_u64 = parse_unsigned(require_value(i, "--threads"), "threads");
-            threads_was_set = true;
+        } else if (flag == "--benchmark") {
+            if (benchmark) fail("--benchmark specified more than once");
+            benchmark = true;
+        } else if (flag == "--benchmark-iters") {
+            if (benchmark_iters_was_set) fail("--benchmark-iters specified more than once");
+            benchmark_iters_u64 = parse_unsigned(require_value(i, "--benchmark-iters"), "benchmark-iters");
+            benchmark_iters_was_set = true;
         } else {
             fail("unknown argument: " + flag);
         }
     }
     if (!op || !model_path || !tensor_name || !m_argument) {
         fail(std::string("missing required argument; usage: ") + program +
-             " --op matmul --model PATH --weight TENSOR_NAME --m M [--dequant-rows N] [--threads N]");
+             " --op matmul --model PATH --weight TENSOR_NAME --m M [--dequant-rows N] [--benchmark] [--benchmark-iters N]");
     }
     if (*op != "matmul") {
         fail("unsupported op: " + *op + " (supported op: matmul)");
     }
     const uint64_t m_u64 = *m_argument;
     if (m_u64 > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
-        threads_u64 > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
-        fail("M or threads exceed supported integer range");
+        benchmark_iters_u64 > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+        fail("M or benchmark-iters exceed supported integer range");
     }
+    if (benchmark_iters_was_set && !benchmark) fail("--benchmark-iters requires --benchmark");
     const int64_t m = static_cast<int64_t>(m_u64);
-    const int threads = static_cast<int>(threads_u64);
+    const int benchmark_iters = static_cast<int>(benchmark_iters_u64);
 
     std::error_code ec;
     const uint64_t model_bytes = std::filesystem::file_size(*model_path, ec);
@@ -423,18 +482,15 @@ int run(int argc, char ** argv) {
     const std::size_t input_values = checked_multiply(m_u64, static_cast<uint64_t>(k), "input element count");
     const std::size_t output_values = checked_multiply(m_u64, static_cast<uint64_t>(n), "output element count");
 
-    const ggml_type_traits_cpu * cpu_traits = ggml_get_type_traits_cpu(tensor_type);
-    if (cpu_traits == nullptr || cpu_traits->vec_dot == nullptr) {
-        fail("ggml CPU IQ3_S dot traits are unavailable");
-    }
-    const std::string input_dot_type = ggml_type_name(cpu_traits->vec_dot_type);
-
     std::vector<uint8_t> weights(tensor_bytes);
     read_exact_at(*model_path, absolute_offset, weights.data(), weights.size());
     std::vector<float> input = read_stdin_f32(input_values);
     if (!std::all_of(input.begin(), input.end(), [](float x) { return std::isfinite(x); })) {
         fail("stdin input contains a NaN or infinity");
     }
+    std::vector<float> y_ggml;
+    compute_ggml_cuda(weights, input, k, n, m, benchmark, benchmark_iters, y_ggml);
+    if (benchmark) return 0;
 
     const ggml_type_traits * traits = ggml_get_type_traits(tensor_type);
     if (traits == nullptr || traits->to_float == nullptr || traits->blck_size != block_elements ||
@@ -466,12 +522,10 @@ int run(int argc, char ** argv) {
         }
     }
 
-    std::vector<float> y_ggml;
-    compute_ggml_cpu(weights, input, k, n, m, threads, y_ggml);
     const std::string header = make_header(*tensor_name, ggml_type_name(tensor_type), k, n,
                                            row_bytes, tensor_bytes, absolute_offset,
                                            static_cast<int64_t>(requested_dequant_rows), m,
-                                           dequant_rows.size(), output_values, input_dot_type);
+                                           dequant_rows.size(), output_values, "cuda");
     write_result(header, m_u64, static_cast<uint64_t>(k), static_cast<uint64_t>(n),
                  requested_dequant_rows, dequant_rows, y_f64, y_ggml);
     return 0;
